@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""SLM Test: a tiny local chat app for Ollama.
+
+Serves a chat page on http://127.0.0.1:8765 and forwards messages to
+Ollama's /api/chat. It talks to nothing else on the network.
+
+The model can also open Omarchy desktop panels through tool calls. It can
+only pick from the fixed TOOLS list below; each one runs a single,
+hard-coded `omarchy-shell` command and nothing the model writes is executed.
+
+Usage: slm-test [--no-browser]
+"""
+import json
+import re
+import socket
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
+HOST, PORT = "127.0.0.1", 8765
+ALLOWED_ORIGINS = {f"http://{HOST}:{PORT}", f"http://localhost:{PORT}"}
+PAGE = (Path(__file__).resolve().parent / "index.html").read_bytes()
+# Replies in progress, so the orb can show when the model is busy.
+ACTIVE = 0
+ACTIVE_LOCK = threading.Lock()
+MAX_TOOL_ROUNDS = 2  # model calls per message: first try, plus one retry without tools
+
+# Every action the model is allowed to take. name -> details.
+# "panel" is the Omarchy shell plugin opened with `omarchy-shell shell summon`.
+TOOLS = {
+    "open_wifi_settings": {
+        "label": "Wi-Fi & Network", "icon": "📶", "panel": "omarchy.network",
+        "keywords": "wifi wi-fi wlan network networks internet ssid hotspot",
+        "description": "Open the Wi-Fi and network settings panel to see or join networks.",
+        "example": "Open my Wi-Fi settings",
+    },
+    "open_bluetooth_settings": {
+        "label": "Bluetooth", "icon": "🔵", "panel": "omarchy.bluetooth",
+        "keywords": "bluetooth pair pairing airpods headset earbuds",
+        "description": "Open the Bluetooth panel to pair or connect devices.",
+        "example": "Show me the Bluetooth devices",
+    },
+    "open_audio_settings": {
+        "label": "Audio", "icon": "🔊", "panel": "omarchy.audio",
+        "keywords": "audio sound volume speaker speakers headphones microphone mic mute unmute",
+        "description": "Open the audio panel to change volume or output/input devices.",
+        "example": "Open the sound settings",
+    },
+    "open_display_settings": {
+        "label": "Display", "icon": "🖥️", "panel": "omarchy.monitor",
+        "keywords": "display displays monitor monitors screen brightness resolution scaling",
+        "description": "Open the display panel for monitors, brightness and scaling.",
+        "example": "Open display settings",
+    },
+    "open_calendar": {
+        "label": "Calendar", "icon": "📅", "panel": "omarchy.clock",
+        "keywords": "calendar date clock",
+        "description": "Open the calendar and clock panel.",
+        "example": "Show me the calendar",
+    },
+    "open_power_menu": {
+        "label": "Power", "icon": "⏻", "panel": "omarchy.power",
+        "keywords": "power shutdown shut reboot restart suspend sleep hibernate lock logout",
+        "description": "Open the power panel (power profile, lock, suspend, restart, shut down). "
+                       "It only opens the panel; the user chooses what to do.",
+        "example": "Open the power menu",
+    },
+    "open_clipboard_history": {
+        "label": "Clipboard history", "icon": "📋", "panel": "omarchy.clipboard",
+        "keywords": "clipboard copied paste",
+        "description": "Open the clipboard history to paste something copied earlier.",
+        "example": "Open my clipboard history",
+    },
+    "open_emoji_picker": {
+        "label": "Emoji picker", "icon": "😀", "panel": "omarchy.emojis",
+        "keywords": "emoji emojis",
+        "description": "Open the emoji picker.",
+        "example": "I need an emoji",
+    },
+    "open_omarchy_menu": {
+        "label": "Omarchy menu", "icon": "☰", "panel": "omarchy.menu",
+        "keywords": "omarchy menu", "payload": {"menu": "root"},
+        "description": "Open the main Omarchy menu (apps, setup, themes, updates, system).",
+        "example": "Open the Omarchy menu",
+    },
+}
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant running locally on the user's Omarchy Linux desktop. "
+    "You have tools that open desktop panels such as Wi-Fi, Bluetooth, audio and display. "
+    "Only call a tool when the user clearly asks to open, show or change one of those things. "
+    "For every other message (questions, facts, math, writing, conversation) answer directly "
+    "in plain text and never call a tool or write JSON. "
+    "You cannot see inside the panels, so never invent their contents."
+)
+
+def tools_for(text):
+    """Ollama tool definitions relevant to the user's message.
+
+    Small models tend to call *some* tool whenever tools are offered, so only
+    offer the ones whose keywords appear in the message (none for "write a haiku").
+    """
+    words = set(re.findall(r"[a-z][a-z-]*", text.lower()))
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t["description"],
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        for name, t in TOOLS.items()
+        if words & set(t["keywords"].split())
+    ]
+
+
+def run_tool(name):
+    """Run an allowed tool. Returns (ok, message for the model)."""
+    tool = TOOLS.get(name)
+    if not tool:
+        return False, f"Unknown tool '{name}'. Available tools: {', '.join(TOOLS)}."
+    try:
+        out = subprocess.run(
+            ["omarchy-shell", "shell", "summon", tool["panel"], json.dumps(tool.get("payload", {}))],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"Could not open {tool['label']}: {e}"
+    if out.returncode == 0 and out.stdout.strip() == "ok":
+        return True, (f"The {tool['label']} panel is now open on the user's screen. "
+                      "You cannot see what is inside it, so do not describe its contents.")
+    return False, f"Could not open {tool['label']} (the panel may be disabled in Omarchy)."
+
+
+def fake_tool_call(text):
+    """If a reply is just a tool call written as JSON text, return the tool name, else None."""
+    s = text.strip().strip("`").strip()
+    if s.startswith("json"):
+        s = s[4:].strip()
+    try:
+        data = json.loads(s)
+    except ValueError:
+        return None
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, dict) and isinstance(data.get("name"), str) and (
+        "parameters" in data or "arguments" in data
+    ):
+        return data["name"]
+    return None
+
+
+def clean_message(m):
+    """Keep only the fields Ollama needs, so the page can't inject anything else."""
+    msg = {"role": str(m["role"]), "content": str(m.get("content", ""))}
+    if msg["role"] not in ("user", "assistant", "tool"):
+        raise ValueError("bad role")
+    if msg["role"] == "assistant" and isinstance(m.get("tool_calls"), list):
+        msg["tool_calls"] = [
+            {"function": {"name": str(c["function"]["name"]), "arguments": {}}}
+            for c in m["tool_calls"]
+        ]
+    if msg["role"] == "tool":
+        msg["tool_name"] = str(m.get("tool_name", ""))
+    return msg
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass  # keep the terminal quiet
+
+    def do_GET(self):
+        if self.path == "/health":
+            # A plain TCP check, so we still only ever *talk* to Ollama's /api/chat.
+            try:
+                socket.create_connection(("127.0.0.1", 11434), timeout=0.5).close()
+                ollama = True
+            except OSError:
+                ollama = False
+            data = json.dumps({"ok": True, "ollama": ollama, "busy": ACTIVE > 0}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path == "/tools":
+            data = json.dumps([
+                {"name": n, "label": t["label"], "icon": t["icon"],
+                 "description": t["description"], "example": t["example"]}
+                for n, t in TOOLS.items()
+            ]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if self.path not in ("/", "/index.html"):
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(PAGE)))
+        self.end_headers()
+        self.wfile.write(PAGE)
+
+    def do_POST(self):
+        global ACTIVE
+        with ACTIVE_LOCK:
+            ACTIVE += 1
+        try:
+            self._chat()
+        finally:
+            with ACTIVE_LOCK:
+                ACTIVE -= 1
+
+    def _chat(self):
+        if self.path != "/chat":
+            self.send_error(404)
+            return
+        # Only accept requests from our own page, not from other websites.
+        origin = self.headers.get("Origin")
+        if origin and origin not in ALLOWED_ORIGINS:
+            self.send_error(403)
+            return
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            model = str(body["model"])
+            messages = [clean_message(m) for m in body["messages"]]
+            use_tools = body.get("tools", True) is not False
+        except (ValueError, KeyError, TypeError):
+            self.send_error(400, "Bad request")
+            return
+
+        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        offered = tools_for(last_user) if use_tools else []
+        system = [{"role": "system", "content": SYSTEM_PROMPT}] if offered else []
+        tools_allowed = bool(offered)
+        offered_names = {t["function"]["name"] for t in offered}
+        headers_sent = False
+        try:
+            for _ in range(MAX_TOOL_ROUNDS):
+                payload = {"model": model, "messages": system + messages, "stream": True}
+                if tools_allowed:
+                    payload["tools"] = offered
+                upstream = self._open_ollama(payload, headers_sent)
+                if upstream is None:
+                    return
+                if not headers_sent:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    headers_sent = True
+                    if getattr(self, "tools_unsupported", False):
+                        self._send_line({"notice": f"{model} doesn't support tools, so panels can't be opened with it."})
+
+                # Stream Ollama's newline-delimited JSON through to the browser,
+                # collecting any tool calls the model makes along the way.
+                # Small models sometimes write a tool call as plain JSON text instead,
+                # so when tools are on and a reply starts with "{" we hold it back
+                # until we know whether it's a real answer or a fake tool call.
+                calls, text, held = [], "", []
+                mode = "undecided" if "tools" in payload else "stream"
+                with upstream:
+                    for line in upstream:
+                        chunk = json.loads(line)
+                        msg = chunk.get("message") or {}
+                        calls += msg.get("tool_calls") or []
+                        text += msg.get("content") or ""
+                        if msg.get("tool_calls") or (chunk.get("done") and calls):
+                            continue  # not part of the visible answer
+                        if mode == "undecided" and text.strip():
+                            mode = "hold" if text.lstrip()[0] in "{[`" else "stream"
+                            if mode == "stream":
+                                for c in held:
+                                    self._send_line(c)
+                                held = []
+                        if mode == "stream":
+                            self._send_line(chunk)
+                        else:
+                            held.append(chunk)
+
+                if not calls and held:
+                    name = fake_tool_call(text)
+                    if name in offered_names:
+                        calls = [{"function": {"name": name}}]
+                        text = ""
+                    elif name is not None:
+                        tools_allowed = False  # it tried to call a tool that doesn't exist: ask again without tools
+                        continue
+                    else:
+                        for c in held:
+                            self._send_line(c)
+                if not calls:
+                    return
+
+                # Run the requested tools (each once) and tell the page. We write the
+                # confirmation ourselves: small models tend to ramble or invent the
+                # panel's contents when asked to follow up on a tool result.
+                names = list(dict.fromkeys(c["function"]["name"] for c in calls))
+                new = [{"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": n, "arguments": {}}} for n in names
+                ]}]
+                opened, failed = [], []
+                for name in names:
+                    if name in offered_names:
+                        ok, result = run_tool(name)
+                    else:
+                        ok, result = False, f"The tool '{name}' is not available for this request."
+                    tool = TOOLS.get(name, {})
+                    label = tool.get("label", name)
+                    (opened if ok else failed).append(label)
+                    self._send_line({"tool_event": {
+                        "name": name, "ok": ok, "label": label, "icon": tool.get("icon", "🔧"),
+                    }})
+                    new.append({"role": "tool", "tool_name": name, "content": result})
+                self._send_line({"history": new})
+                reply = []
+                if opened:
+                    reply.append(f"I opened {' and '.join(opened)} for you.")
+                if failed:
+                    reply.append(f"I couldn't open {' and '.join(failed)}. It may be turned off in Omarchy.")
+                self._send_line({"message": {"role": "assistant", "content": " ".join(reply)}, "done": True})
+                return
+            self._send_line({"error": "The model didn't give an answer. Try rephrasing."})
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # user pressed Stop
+
+    def _open_ollama(self, payload, headers_sent):
+        req = urllib.request.Request(
+            OLLAMA_CHAT_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            return urllib.request.urlopen(req, timeout=300)
+        except urllib.error.HTTPError as e:
+            code, message = e.code, e.read().decode(errors="replace")
+            if "does not support tools" in message and "tools" in payload:
+                # Fall back to plain chat for models without tool support.
+                del payload["tools"]
+                payload["messages"] = [m for m in payload["messages"] if m["role"] != "system"]
+                self.tools_unsupported = True
+                return self._open_ollama(payload, headers_sent)
+        except (urllib.error.URLError, OSError) as e:
+            code, message = 502, f"Can't reach Ollama at {OLLAMA_CHAT_URL}: {e}"
+        if headers_sent:
+            try:
+                message = json.loads(message).get("error", message)
+            except (ValueError, AttributeError):
+                pass
+            self._send_line({"error": message})
+        else:
+            self._send_error_json(code, message)
+        return None
+
+    def _send_line(self, obj):
+        self.wfile.write(json.dumps(obj).encode() + b"\n")
+        self.wfile.flush()
+
+    def _send_error_json(self, code, message):
+        try:
+            message = json.loads(message).get("error", message)
+        except (ValueError, AttributeError):
+            pass
+        data = json.dumps({"error": message}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def main():
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError:
+        # Already running: just open the page.
+        print(f"SLM Test is already running at http://{HOST}:{PORT}")
+        if "--no-browser" in sys.argv:
+            sys.exit(1)  # running as a service: fail so systemd retries once the port is free
+        webbrowser.open(f"http://{HOST}:{PORT}")
+        return
+    url = f"http://{HOST}:{PORT}"
+    print(f"SLM Test running at {url}  (Ctrl+C to stop)")
+    if "--no-browser" not in sys.argv:
+        threading.Timer(0.3, webbrowser.open, [url]).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

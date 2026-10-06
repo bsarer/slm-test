@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "bsarer.slm-test",
+  "name": "SLM Test",
+  "version": "1.0.0",
+  "author": "bsarer",
+  "description": "Orb in the bar that opens a full-page chat with a local Ollama model",
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Chat.qml",
+    "barWidget": "Orb.qml"
+  },
+  "barWidget": {
+    "displayName": "SLM Test orb",
+    "description": "Click to chat with your local model",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

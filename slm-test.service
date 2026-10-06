@@ -1,0 +1,11 @@
+[Unit]
+Description=SLM Test local chat server (talks only to Ollama)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/slm-test --no-browser
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

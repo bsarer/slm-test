@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SLM Test</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1f; --muted: #6e6e73;
+    --border: #e2e2de; --user: #2f6fed; --user-text: #ffffff; --bot: #ffffff;
+    --error: #c4302b; --accent: #2f6fed;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --panel: #1c1c1f; --text: #ececf0; --muted: #8e8e96;
+      --border: #2c2c31; --user: #3b74f0; --user-text: #ffffff; --bot: #222226;
+      --error: #ff6b63; --accent: #5b8cff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  .spacer { flex: 1; }
+  label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  input, textarea, button { font: inherit; color: inherit; }
+  input {
+    width: 160px; padding: 5px 8px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  button {
+    padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #log {
+    flex: 1; overflow-y: auto; padding: 20px 16px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .msg {
+    max-width: min(720px, 85%); padding: 9px 13px; border-radius: 12px;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .user { align-self: flex-end; background: var(--user); color: var(--user-text); }
+  .assistant { align-self: flex-start; background: var(--bot); border: 1px solid var(--border); }
+  .error { align-self: center; color: var(--error); font-size: 13px; }
+  .stats { align-self: flex-start; color: var(--muted); font-size: 12px; margin-top: -6px; }
+  .empty { margin: auto; color: var(--muted); text-align: center; }
+  .tool {
+    align-self: flex-start; font-size: 13px; padding: 4px 10px; border-radius: 999px;
+    border: 1px dashed var(--border); color: var(--muted);
+  }
+  .tool.fail { color: var(--error); border-color: var(--error); }
+
+  /* Tools menu */
+  .tools-wrap { position: relative; }
+  #tools-btn[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+  #tools-menu {
+    position: absolute; right: 0; top: calc(100% + 6px); z-index: 10;
+    width: min(380px, calc(100vw - 32px)); max-height: 70vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.18); padding: 8px;
+  }
+  #tools-menu[hidden] { display: none; }
+  .tools-head { padding: 6px 8px 8px; font-size: 13px; color: var(--muted); }
+  .tools-head strong { display: block; color: var(--text); font-size: 14px; margin-bottom: 2px; }
+  .tool-item {
+    display: grid; grid-template-columns: 28px 1fr; gap: 2px 8px; width: 100%;
+    text-align: left; border: 0; border-radius: 8px; padding: 8px; background: none;
+  }
+  .tool-item:hover, .tool-item:focus-visible { background: var(--bg); }
+  .tool-item .ic { grid-row: span 2; font-size: 18px; line-height: 1.3; text-align: center; }
+  .tool-item .nm { font-weight: 600; font-size: 14px; }
+  .tool-item .ex { color: var(--muted); font-size: 12.5px; }
+  .tools-foot {
+    border-top: 1px solid var(--border); margin-top: 6px; padding: 8px 8px 4px;
+    font-size: 13px; color: var(--muted);
+  }
+  .tools-foot label { color: var(--text); font-size: 13px; cursor: pointer; }
+  form {
+    display: flex; gap: 8px; padding: 12px 16px;
+    border-top: 1px solid var(--border); background: var(--panel);
+  }
+  textarea {
+    flex: 1; resize: none; padding: 9px 12px; border-radius: 10px; min-height: 42px; max-height: 200px;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SLM Test</h1>
+  <span class="spacer"></span>
+  <label>Model <input id="model" value="llama3.2" spellcheck="false"></label>
+  <div class="tools-wrap">
+    <button id="tools-btn" type="button" aria-expanded="false" aria-controls="tools-menu">🔧 Tools</button>
+    <div id="tools-menu" hidden>
+      <div class="tools-head">
+        <strong>What the model can open</strong>
+        Just ask in your own words. Click one to try an example.
+      </div>
+      <div id="tools-list"></div>
+      <div class="tools-foot">
+        <label><input type="checkbox" id="tools-on" checked> Let the model use tools</label>
+      </div>
+    </div>
+  </div>
+  <button id="clear" type="button">New chat</button>
+</header>
+
+<main id="log"><div class="empty">Chat with a local model through Ollama.<br>Enter to send · Shift+Enter for a new line<br>Open <b>🔧 Tools</b> to see which Omarchy panels the model can open.</div></main>
+
+<form id="form">
+  <textarea id="input" rows="1" placeholder="Message…" autofocus></textarea>
+  <button id="send" class="primary" type="submit">Send</button>
+</form>
+
+<script>
+const log = document.getElementById("log");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const modelInput = document.getElementById("model");
+let messages = [];
+let controller = null;
+
+try { modelInput.value = localStorage.getItem("slm-model") || modelInput.value; } catch {}
+modelInput.addEventListener("change", () => {
+  try { localStorage.setItem("slm-model", modelInput.value.trim()); } catch {}
+});
+
+// ---- Tools menu ----
+const toolsBtn = document.getElementById("tools-btn");
+const toolsMenu = document.getElementById("tools-menu");
+const toolsList = document.getElementById("tools-list");
+const toolsOn = document.getElementById("tools-on");
+
+try { toolsOn.checked = localStorage.getItem("slm-tools") !== "off"; } catch {}
+toolsOn.addEventListener("change", () => {
+  try { localStorage.setItem("slm-tools", toolsOn.checked ? "on" : "off"); } catch {}
+});
+
+function setMenu(open) {
+  toolsMenu.hidden = !open;
+  toolsBtn.setAttribute("aria-expanded", String(open));
+}
+toolsBtn.addEventListener("click", () => setMenu(toolsMenu.hidden));
+document.addEventListener("click", (e) => {
+  if (!toolsMenu.hidden && !e.target.closest(".tools-wrap")) setMenu(false);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !toolsMenu.hidden) { setMenu(false); toolsBtn.focus(); }
+});
+
+fetch("/tools").then((r) => r.json()).then((tools) => {
+  for (const t of tools) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "tool-item";
+    b.title = t.description;
+    b.innerHTML = '<span class="ic"></span><span class="nm"></span><span class="ex"></span>';
+    b.querySelector(".ic").textContent = t.icon;
+    b.querySelector(".nm").textContent = t.label;
+    b.querySelector(".ex").textContent = `“${t.example}”`;
+    b.addEventListener("click", () => {
+      input.value = t.example;
+      input.dispatchEvent(new Event("input"));
+      setMenu(false);
+      input.focus();
+    });
+    toolsList.appendChild(b);
+  }
+}).catch(() => { toolsList.textContent = "Couldn't load the tool list."; });
+
+function add(cls, text) {
+  log.querySelector(".empty")?.remove();
+  const el = document.createElement("div");
+  el.className = "msg " + cls;
+  el.textContent = text;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function setBusy(busy) {
+  sendBtn.textContent = busy ? "Stop" : "Send";
+  sendBtn.classList.toggle("primary", !busy);
+}
+
+// Insert a line just above the reply bubble, so tool activity reads before the answer.
+function addBefore(bubble, cls, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + cls;
+  el.textContent = text;
+  log.insertBefore(el, bubble);
+  return el;
+}
+
+async function send(text) {
+  const start = messages.length;
+  messages.push({ role: "user", content: text });
+  add("user", text);
+  const bubble = add("assistant", "…");
+  let reply = "";
+  controller = new AbortController();
+  setBusy(true);
+
+  try {
+    const res = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelInput.value.trim(), messages, tools: toolsOn.checked }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const chunk = JSON.parse(line);
+        if (chunk.error) throw new Error(chunk.error);
+        if (chunk.notice) { addBefore(bubble, "stats", chunk.notice); continue; }
+        if (chunk.tool_event) {
+          const t = chunk.tool_event;
+          addBefore(bubble, "tool" + (t.ok ? "" : " fail"),
+            `${t.icon} ${t.ok ? "Opened" : "Couldn't open"} ${t.label}`);
+          continue;
+        }
+        if (chunk.history) { messages.push(...chunk.history); reply = ""; continue; }
+        reply += chunk.message?.content || "";
+        bubble.textContent = reply || "…";
+        log.scrollTop = log.scrollHeight;
+        if (chunk.done && chunk.eval_count) {
+          const secs = chunk.eval_duration / 1e9;
+          add("stats", `${chunk.eval_count} tokens · ${(chunk.eval_count / secs).toFixed(1)} tok/s · ${(chunk.total_duration / 1e9).toFixed(1)}s total`);
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      add("stats", "stopped");
+    } else {
+      if (!reply) bubble.remove();
+      add("error", e.message);
+    }
+  } finally {
+    if (reply) messages.push({ role: "assistant", content: reply });
+    else if (messages.length > start + 1) bubble.remove(); // tools ran but the model said nothing more
+    else messages.length = start; // drop the unanswered question so it can be retried cleanly
+    controller = null;
+    setBusy(false);
+    input.focus();
+  }
+}
+
+document.getElementById("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (controller) { controller.abort(); return; }
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  input.style.height = "";
+  send(text);
+});
+
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    document.getElementById("form").requestSubmit();
+  }
+});
+
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = input.scrollHeight + "px";
+});
+
+document.getElementById("clear").addEventListener("click", () => {
+  controller?.abort();
+  messages = [];
+  log.innerHTML = '<div class="empty">New chat. Say hello.</div>';
+  input.focus();
+});
+</script>
+</body>
+</html>
